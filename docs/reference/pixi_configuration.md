@@ -130,6 +130,49 @@ It is shared with other rattler-based tools, so it can also be set in a `rattler
     With `pixi config set`, a table is given as JSON, e.g. `pixi config set exclude-newer '{"cutoff": "7d", "exemptions": {"ruff": "*"}}'`.
     Keys inside it can also be set and unset on their own, e.g. `pixi config set exclude-newer.exemptions.ruff '*'` or `pixi config unset exclude-newer.exemptions.ruff`.
 
+### `attestation-verification`
+
+Checks the [Sigstore](https://www.sigstore.dev/) attestations of conda packages when they are locked.
+An attestation is signed by the publisher of a package, for example the GitHub Actions workflow that built it, and binds the package's sha256 to that publisher ([CEP 27](https://conda.org/learn/ceps/cep-0027/)).
+Channels serve it next to the package.
+The check is off by default.
+
+- `mode`: `"disabled"` (default), `"warn"` or `"require"`.
+  With `warn`, problems are reported as warnings.
+  With `require`, locking fails unless every newly locked conda package has a valid attestation from a trusted publisher.
+  This includes packages from channels that don't sign their packages, such as conda-forge today, so `require` is only practical for workspaces whose channels all sign.
+- `default.identity`: the identity that must have signed the attestation, for example `https://github.com/my-org/my-repo/.github/workflows/release.yml@refs/heads/main`.
+  `*` matches any sequence of characters, so `https://github.com/my-org/*` accepts every workflow of every repository of `my-org`.
+  `require` needs an identity, because any valid signature would be accepted otherwise.
+- `default.issuer`: the OIDC issuer that must have issued the signing certificate, for example `https://token.actions.githubusercontent.com` for GitHub Actions.
+
+```toml title="config.toml"
+--8<-- "docs/source_files/pixi_config_tomls/main_config.toml:attestation-verification"
+```
+
+Attestations are checked whenever the lock file is updated, for example by `pixi lock`, `pixi add` or `pixi update`, and only for conda packages that are new to the lock file or whose sha256 changed.
+`pixi install` from an up-to-date lock file doesn't check them: the lock file pins the sha256 that the attestation is bound to.
+This means that every package already in `pixi.lock` is trusted, including packages that were locked before the check was turned on and lock files that were edited by hand or come from someone else, so review changes to `pixi.lock`.
+
+If an attestation names the channel it was published to, that channel must match the channel of the package.
+Attestations that don't name a channel are accepted from any channel.
+A [mirror](#mirror-configuration) is checked against the channel it mirrors.
+Sigstore's trusted root is fetched from Sigstore directly.
+That request respects the `HTTPS_PROXY` environment variables, but not [`proxy-config`](#proxy-config), [`tls-root-certs`](#tls-root-certs) or [mirrors](#mirror-configuration).
+
+In [offline](#offline) mode, attestations can only be read from local `file://` channels, and are checked against a copy of the trusted root built into pixi.
+The attestations of packages from other channels can't be fetched, which fails locking with `require` and is reported as a warning with `warn`.
+
+!!! note "Merging"
+    Unlike other options, a higher priority configuration can't relax this one.
+    The strictest `mode` of all configuration files applies, and a package must satisfy the `default` rule of every file that sets one.
+    Each file holds one rule, so `[[attestation-verification.default]]` is an error, but `pixi config list` shows the rules of all files as a list.
+    For example, a project's `.pixi/config.toml` can't turn off `require` set in `/etc/pixi/config.toml`.
+    This only applies to the configuration files that are loaded: [`--no-config` and `--config-file`](#skipping-or-overriding-config-discovery) skip the system and user files.
+
+!!! note "Not checked yet"
+    PyPI packages, build backends and the build and host dependencies of [source packages](../build/getting_started.md), and the environments of `pixi global` and `pixi exec`.
+
 ### `shell`
 
 - `change-ps1`:  When set to `false`, the `(pixi)` prefix in the shell prompt is removed.

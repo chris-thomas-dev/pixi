@@ -47,6 +47,15 @@ run-post-link-scripts = "false"  # set to "insecure" to allow running post-link 
 tool-platform = "win-64"  # force tools like build backends to be installed for a specific platform
 # --8<-- [end:tool-platform]
 
+# --8<-- [start:attestation-verification]
+[attestation-verification]
+# "disabled" (default), "warn" or "require"
+mode = "require"
+# The publisher that must have signed the attestation, `*` matches anything.
+default.identity = "https://github.com/my-org/*"
+default.issuer = "https://token.actions.githubusercontent.com"
+# --8<-- [end:attestation-verification]
+
 # --8<-- [start:cache]
 [cache]
 # Override for the cache root. Equivalent to setting PIXI_CACHE_DIR.

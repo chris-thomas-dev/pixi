@@ -215,6 +215,8 @@ cosign verify-blob \
   my-package-0.1.0-h123_0.conda
 ```
 
+To have Pixi check the attestations of the conda packages you lock, see [`attestation-verification`](reference/pixi_configuration.md#attestation-verification).
+
 One example of a channel that already uses package signing extensively is the [github-releases](https://prefix.dev/channels/github-releases) channel on prefix.dev (GitHub: [hunger/octoconda](https://github.com/hunger/octoconda)).
 
 !!! note ""

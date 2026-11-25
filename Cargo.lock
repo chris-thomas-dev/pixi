@@ -6704,6 +6704,7 @@ dependencies = [
 name = "pixi_core"
 version = "0.1.0"
 dependencies = [
+ "astral-reqwest-middleware",
  "async-once-cell",
  "async-trait",
  "barrier_cell",
@@ -6764,6 +6765,7 @@ dependencies = [
  "rattler_networking",
  "rattler_repodata_gateway",
  "rattler_shell",
+ "rattler_sigstore",
  "rattler_solve",
  "rattler_virtual_package_detectors",
  "rattler_virtual_packages",

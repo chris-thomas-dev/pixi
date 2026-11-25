@@ -617,6 +617,7 @@ impl WorkspaceMut {
                 .finish(),
         )
         .with_lock_file(unlocked_lock_file)
+        .with_original_lock_file(&original_lock_file)
         .with_no_install(no_install || dry_run)
         .finish()
         .await?

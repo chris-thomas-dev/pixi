@@ -1309,6 +1309,12 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude_newer: Option<ExcludeNewerConfig>,
 
+    /// Checks the Sigstore attestations of conda packages when they are
+    /// locked.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "AttestationVerificationConfig::is_default")]
+    pub attestation_verification: AttestationVerificationConfig,
+
     #[serde(skip)]
     #[serde(alias = "loaded_from")] // BREAK: remove to stop supporting snake_case alias
     pub loaded_from: Vec<PathBuf>,
@@ -1449,6 +1455,7 @@ impl Default for Config {
             detached_environments: None,
             pinning_strategy: None,
             exclude_newer: None,
+            attestation_verification: AttestationVerificationConfig::default(),
             shell: ShellConfig::default(),
             experimental: ExperimentalConfig::default(),
             virtual_package_detectors: VirtualPackageDetectorsConfig::default(),
@@ -1706,6 +1713,159 @@ impl ShellConfig {
     }
 }
 
+/// How strictly the Sigstore attestations of newly locked conda packages are
+/// checked.
+///
+/// The variants are ordered from least to most strict, so that merging config
+/// layers can keep the strictest mode.
+#[derive(
+    Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum AttestationVerificationMode {
+    /// Attestations are not checked.
+    #[default]
+    Disabled,
+    /// Problems with attestations are reported as warnings.
+    Warn,
+    /// Every newly locked conda package must have an attestation from a
+    /// trusted publisher, otherwise locking fails.
+    Require,
+}
+
+impl FromStr for AttestationVerificationMode {
+    type Err = serde::de::value::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::deserialize(s.into_deserializer())
+    }
+}
+
+/// A rule that the signer of an attestation must satisfy.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct TrustedPublisher {
+    /// The identity of the signing certificate, for example a GitHub Actions
+    /// workflow URL. `*` matches any sequence of characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+
+    /// The OIDC issuer the signing certificate must have been issued for, for
+    /// example `https://token.actions.githubusercontent.com`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+}
+
+impl TrustedPublisher {
+    fn is_empty(&self) -> bool {
+        self.identity.is_none() && self.issuer.is_none()
+    }
+}
+
+/// The `[attestation-verification]` section.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct AttestationVerificationConfig {
+    /// How strictly attestations are checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<AttestationVerificationMode>,
+
+    /// The trusted publisher rules, one for each config layer that sets
+    /// `default`. A package must satisfy all of them.
+    ///
+    /// A config file holds at most one rule, written as a table. Merged
+    /// layers serialize as an array of tables, which is only shown by
+    /// `pixi config list` and is rejected in a config file.
+    #[serde(
+        default,
+        rename = "default",
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_trusted_publishers",
+        serialize_with = "serialize_trusted_publishers"
+    )]
+    pub default_publishers: Vec<TrustedPublisher>,
+}
+
+impl AttestationVerificationConfig {
+    /// Merges `other`, which has higher priority, into `self`.
+    ///
+    /// Unlike most settings, a higher priority layer cannot relax a lower
+    /// one: the strictest mode wins and the trusted publisher rules of all
+    /// layers apply together.
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            mode: self.mode.max(other.mode),
+            default_publishers: self
+                .default_publishers
+                .into_iter()
+                .chain(other.default_publishers)
+                .collect(),
+        }
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.mode.is_none() && self.default_publishers.is_empty()
+    }
+
+    /// The mode, defaulting to [`AttestationVerificationMode::Disabled`].
+    pub fn mode(&self) -> AttestationVerificationMode {
+        self.mode.unwrap_or_default()
+    }
+
+    /// The single rule of one config file, created if missing, for editing
+    /// with `pixi config set`.
+    fn default_publisher_mut(&mut self) -> &mut TrustedPublisher {
+        if self.default_publishers.is_empty() {
+            self.default_publishers.push(TrustedPublisher::default());
+        }
+        &mut self.default_publishers[0]
+    }
+
+    /// Drops a rule left without any constraints by `pixi config unset`.
+    fn remove_empty_publishers(&mut self) {
+        self.default_publishers
+            .retain(|publisher| !publisher.is_empty());
+    }
+}
+
+fn deserialize_trusted_publishers<'de, D>(
+    deserializer: D,
+) -> Result<Vec<TrustedPublisher>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // A visitor that only accepts a table. Deserializing `TrustedPublisher`
+    // directly would also accept an array, read positionally.
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<TrustedPublisher>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a single table with `identity` and `issuer`")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            TrustedPublisher::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                .map(|publisher| vec![publisher])
+        }
+    }
+
+    deserializer.deserialize_map(Visitor)
+}
+
+fn serialize_trusted_publishers<S>(
+    publishers: &[TrustedPublisher],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match publishers {
+        [publisher] => publisher.serialize(serializer),
+        publishers => publishers.serialize(serializer),
+    }
+}
+
 // `ProxyConfig` now lives in `rattler_config`. Re-exported for
 // back-compat. Note: rattler's `Default::default()` reads `HTTP_PROXY`
 // / `HTTPS_PROXY` / `NO_PROXY` env vars into the struct, whereas
@@ -1813,6 +1973,30 @@ pub enum SetConfigError {
     Path(#[from] ConfigPathError),
     #[error("{0}")]
     DetectorConsent(String),
+}
+
+/// Parses a JSON value for `pixi config set`, rejecting fields that would
+/// otherwise be dropped. A config file only warns about unknown keys, but a
+/// misspelled field passed to `set` would silently replace the existing
+/// value.
+fn from_json_rejecting_unknown_fields<T: serde::de::DeserializeOwned>(
+    key: &str,
+    value: &str,
+) -> Result<T, SetConfigError> {
+    #[derive(Debug, thiserror::Error)]
+    #[error("unknown field `{0}`")]
+    struct UnknownField(String);
+
+    let mut unknown = Vec::new();
+    let parsed =
+        serde_ignored::deserialize(&mut serde_json::Deserializer::from_str(value), |path| {
+            unknown.push(path.to_string())
+        })
+        .map_err(invalid_value(key))?;
+    match unknown.into_iter().next() {
+        Some(field) => Err(invalid_value(key)(UnknownField(field))),
+        None => Ok(parsed),
+    }
 }
 
 fn invalid_value<E: std::error::Error + Send + Sync + 'static>(
@@ -2215,6 +2399,11 @@ impl Config {
     // Get all possible keys of the configuration
     pub fn get_keys(&self) -> &[&str] {
         &[
+            "attestation-verification",
+            "attestation-verification.default",
+            "attestation-verification.default.identity",
+            "attestation-verification.default.issuer",
+            "attestation-verification.mode",
             "authentication-override-file",
             "cache",
             "cache.build-tool-environments",
@@ -2333,6 +2522,9 @@ impl Config {
             detached_environments: other.detached_environments.or(self.detached_environments),
             pinning_strategy: other.pinning_strategy.or(self.pinning_strategy),
             exclude_newer: other.exclude_newer.or(self.exclude_newer),
+            attestation_verification: self
+                .attestation_verification
+                .merge(other.attestation_verification),
             shell: self.shell.merge(other.shell),
             experimental: self.experimental.merge(other.experimental),
             virtual_package_detectors: merge_virtual_package_detectors(
@@ -2577,6 +2769,11 @@ impl Config {
                         rattler_config::edit::ConfigEditError::UnknownKey { .. } => err,
                         source => SetConfigError::from_exclude_newer_edit(key, source),
                     })?;
+            }
+            key if key == "attestation-verification"
+                || key.starts_with("attestation-verification.") =>
+            {
+                self.set_attestation_verification(key, value)?;
             }
             "pinning-strategy" => {
                 self.pinning_strategy = value
@@ -2933,6 +3130,54 @@ impl Config {
             _ => return Err(err),
         }
 
+        Ok(())
+    }
+
+    /// Sets `attestation-verification` or a key below it.
+    fn set_attestation_verification(
+        &mut self,
+        key: &str,
+        value: Option<String>,
+    ) -> Result<(), SetConfigError> {
+        let err = SetConfigError::UnknownKey {
+            key: key.to_string(),
+            supported_keys: self.get_keys().join(",\n\t"),
+        };
+        let section = &mut self.attestation_verification;
+        match key {
+            "attestation-verification" => {
+                *section = value
+                    .map(|v| from_json_rejecting_unknown_fields(key, &v))
+                    .transpose()?
+                    .unwrap_or_default();
+            }
+            "attestation-verification.mode" => {
+                section.mode = parse_opt(value, key)?;
+            }
+            "attestation-verification.default" => {
+                // Parsed like the `default` key of a config file, which only
+                // accepts a table.
+                #[derive(Deserialize)]
+                #[serde(transparent)]
+                struct DefaultRule(
+                    #[serde(deserialize_with = "deserialize_trusted_publishers")]
+                    Vec<TrustedPublisher>,
+                );
+                section.default_publishers = value
+                    .map(|v| from_json_rejecting_unknown_fields::<DefaultRule>(key, &v))
+                    .transpose()?
+                    .map(|rule| rule.0)
+                    .unwrap_or_default();
+            }
+            "attestation-verification.default.identity" => {
+                section.default_publisher_mut().identity = value;
+            }
+            "attestation-verification.default.issuer" => {
+                section.default_publisher_mut().issuer = value;
+            }
+            _ => return Err(err),
+        }
+        section.remove_empty_publishers();
         Ok(())
     }
 
@@ -3359,6 +3604,197 @@ UNUSED = "unused"
         config.set("exclude-newer", None).unwrap();
         assert_eq!(config.exclude_newer, None);
     }
+
+    #[test]
+    fn test_config_parse_attestation_verification() {
+        let toml = r#"
+            [attestation-verification]
+            mode = "require"
+
+            [attestation-verification.default]
+            identity = "https://github.com/my-org/*"
+            issuer = "https://token.actions.githubusercontent.com"
+        "#;
+        let (config, unused) = Config::from_toml(toml, None).unwrap();
+        assert!(unused.is_empty());
+        assert_eq!(
+            config.attestation_verification,
+            AttestationVerificationConfig {
+                mode: Some(AttestationVerificationMode::Require),
+                default_publishers: vec![TrustedPublisher {
+                    identity: Some("https://github.com/my-org/*".to_string()),
+                    issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+                }],
+            }
+        );
+    }
+
+    // spellchecker:off
+    #[test]
+    fn test_config_parse_attestation_verification_reports_unknown_keys() {
+        let toml = r#"
+            [attestation-verification]
+            mode = "warn"
+            default.identty = "https://github.com/my-org/*"
+        "#;
+        let (_, unused) = Config::from_toml(toml, None).unwrap();
+        assert_eq!(
+            unused.into_iter().collect::<Vec<_>>(),
+            ["attestation-verification.default.identty"]
+        );
+    }
+    // spellchecker:on
+
+    #[test]
+    fn test_attestation_verification_merges_strictest() {
+        let layer = |toml: &str| Config::from_toml(toml, None).unwrap().0;
+        let system = layer(
+            r#"
+            [attestation-verification]
+            mode = "require"
+            default.identity = "https://github.com/my-org/*"
+            "#,
+        );
+        let workspace = layer(
+            r#"
+            [attestation-verification]
+            mode = "disabled"
+            default.identity = "*"
+            "#,
+        );
+
+        let merged = system.merge_config(workspace);
+        let section = &merged.attestation_verification;
+        assert_eq!(section.mode(), AttestationVerificationMode::Require);
+        assert_eq!(section.default_publishers.len(), 2);
+
+        // The merged rules serialize as an array of tables for `pixi config
+        // list`.
+        insta::assert_snapshot!(toml_edit::ser::to_string_pretty(&merged).unwrap(), @r#"
+        [attestation-verification]
+        mode = "require"
+
+        [[attestation-verification.default]]
+        identity = "https://github.com/my-org/*"
+
+        [[attestation-verification.default]]
+        identity = "*"
+        "#);
+    }
+
+    /// A config file holds one rule. `set` edits that rule, so it can't be
+    /// a list that `set` would only partly edit.
+    #[test]
+    fn test_attestation_verification_rejects_a_list_of_rules() {
+        let toml = r#"
+            [[attestation-verification.default]]
+            identity = "https://github.com/my-org/*"
+        "#;
+        let err = Config::from_toml(toml, None).unwrap_err();
+        insta::assert_snapshot!(
+            std::iter::successors(Some(&err as &dyn std::error::Error), |e| e.source())
+                .format(": ")
+                .to_string()
+                .trim_end(),
+            @"
+        TOML parse error at line 2, column 13
+          |
+        2 |             [[attestation-verification.default]]
+          |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        invalid type: sequence, expected a single table with `identity` and `issuer`
+        "
+        );
+    }
+
+    #[test]
+    fn test_set_attestation_verification() {
+        let mut config = Config::default();
+        config
+            .set("attestation-verification.mode", Some("warn".to_string()))
+            .unwrap();
+        config
+            .set(
+                "attestation-verification.default.identity",
+                Some("https://github.com/my-org/*".to_string()),
+            )
+            .unwrap();
+        insta::assert_snapshot!(toml_edit::ser::to_string_pretty(&config).unwrap(), @r#"
+        [attestation-verification]
+        mode = "warn"
+
+        [attestation-verification.default]
+        identity = "https://github.com/my-org/*"
+        "#);
+
+        // Unsetting the last constraint removes the rule.
+        config
+            .set("attestation-verification.default.identity", None)
+            .unwrap();
+        assert!(
+            config
+                .attestation_verification
+                .default_publishers
+                .is_empty()
+        );
+
+        assert!(matches!(
+            config.set("attestation-verification.mode", Some("strict".to_string())),
+            Err(SetConfigError::InvalidValue { .. })
+        ));
+        assert!(matches!(
+            config.set("attestation-verification.bogus", Some("x".to_string())),
+            Err(SetConfigError::UnknownKey { .. })
+        ));
+
+        config.set("attestation-verification", None).unwrap();
+        assert!(config.attestation_verification.is_default());
+    }
+
+    // spellchecker:off
+    /// A misspelled field or an array passed to `set` is an error rather
+    /// than replacing the rule.
+    #[test]
+    fn test_set_attestation_verification_rejects_invalid_rules() {
+        let mut config = Config::default();
+        config
+            .set(
+                "attestation-verification.default.identity",
+                Some("https://github.com/my-org/*".to_string()),
+            )
+            .unwrap();
+        let before = config.attestation_verification.clone();
+
+        let errors = [
+            (
+                "attestation-verification.default",
+                r#"{"identty": "https://github.com/other-org/*"}"#,
+            ),
+            (
+                "attestation-verification",
+                r#"{"mode": "warn", "default": {"identty": "https://github.com/other-org/*"}}"#,
+            ),
+            (
+                "attestation-verification.default",
+                r#"["https://github.com/other-org/*", "https://token.actions.githubusercontent.com"]"#,
+            ),
+        ]
+        .into_iter()
+        .map(|(key, value)| {
+            let err = config.set(key, Some(value.to_string())).unwrap_err();
+            let SetConfigError::InvalidValue { source, .. } = &err else {
+                panic!("expected an invalid value error, got {err:?}");
+            };
+            format!("{err}: {source}")
+        })
+        .join("\n");
+        insta::assert_snapshot!(errors, @"
+        invalid value for `attestation-verification.default`: unknown field `identty`
+        invalid value for `attestation-verification`: unknown field `default.identty`
+        invalid value for `attestation-verification.default`: invalid type: sequence, expected a single table with `identity` and `issuer` at line 1 column 0
+        ");
+        assert_eq!(config.attestation_verification, before);
+    }
+    // spellchecker:on
 
     /// Assert that usage of `~` in `detached_environments` is correctly expanded
     /// to the absolute path to the home directory.
@@ -3906,6 +4342,13 @@ UNUSED = "unused"
             )]),
             pinning_strategy: Some(PinningStrategy::NoPin),
             exclude_newer: Some(ExcludeNewerConfig::from_cutoff("7d".parse().unwrap())),
+            attestation_verification: AttestationVerificationConfig {
+                mode: Some(AttestationVerificationMode::Warn),
+                default_publishers: vec![TrustedPublisher {
+                    identity: Some("https://github.com/my-org/*".to_string()),
+                    issuer: None,
+                }],
+            },
             experimental: ExperimentalConfig {
                 use_environment_activation_cache: Some(true),
                 conda_script: None,

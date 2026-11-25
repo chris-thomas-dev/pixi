@@ -9,6 +9,8 @@ repository.workspace = true
 license.workspace = true
 
 [features]
+native-tls = ["rattler_sigstore/native-tls"]
+rustls = ["rattler_sigstore/rustls"]
 self_update = []
 slow_integration_tests = []
 
@@ -69,9 +71,11 @@ rattler_lock = { workspace = true }
 rattler_networking = { workspace = true, default-features = false }
 rattler_repodata_gateway = { workspace = true }
 rattler_shell = { workspace = true }
+rattler_sigstore = { workspace = true }
 rattler_solve = { workspace = true }
 rattler_virtual_package_detectors = { workspace = true }
 rattler_virtual_packages = { workspace = true }
+reqwest-middleware = { workspace = true }
 rstest = { workspace = true }
 serde = { workspace = true }
 serde_ignored = { workspace = true }

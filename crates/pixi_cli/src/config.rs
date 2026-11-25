@@ -1,5 +1,6 @@
 use crate::cli_config::WorkspaceConfig;
 use clap::Parser;
+use itertools::Itertools;
 use miette::{IntoDiagnostic, WrapErr};
 use pixi_config;
 use pixi_config::{Config, ConfigError, GlobalConfigSource};
@@ -950,7 +951,7 @@ fn partial_config(config: &Config, key: &str) -> miette::Result<JsonValue> {
     }
 
     // TOML omits unset fields instead of serializing them as null.
-    let mut value: JsonValue =
+    let value: JsonValue =
         toml_edit::de::from_str(&toml_edit::ser::to_string(config).into_diagnostic()?)
             .into_diagnostic()?;
     let consent_origin = key_path.consent_origin();
@@ -958,30 +959,41 @@ fn partial_config(config: &Config, key: &str) -> miette::Result<JsonValue> {
         .as_ref()
         .map(ChannelUrl::as_str)
         .unwrap_or_else(|| key_path.target());
-    for segment in key_path
+    // Each segment is looked up under one name and shown under another.
+    let segments = key_path
         .parent_keys
         .iter()
-        .map(String::as_str)
-        .chain(once(lookup_target))
-    {
-        let spelling = key_spellings(segment)
-            .into_iter()
-            .find(|spelling| value.get(spelling).is_some());
-        match spelling.as_deref().and_then(|key| value.get_mut(key)) {
-            Some(child) => value = child.take(),
-            None => return Ok(JsonValue::Object(Default::default())),
-        }
-    }
+        .map(|segment| (segment.as_str(), segment.as_str()))
+        .chain(once((lookup_target, key_path.target())))
+        .collect_vec();
 
-    Ok(key_path
-        .parent_keys
-        .iter()
-        .map(String::as_str)
-        .chain(once(key_path.target()))
-        .rev()
-        .fold(value, |value, segment| {
-            JsonValue::Object([(segment.to_string(), value)].into_iter().collect())
-        }))
+    Ok(select_partial(value, &segments).unwrap_or_else(|| JsonValue::Object(Default::default())))
+}
+
+/// Selects `segments` in `value`, wrapped in their parent tables, or `None`
+/// if the key is not set.
+///
+/// An array of tables, such as the `attestation-verification.default` rules
+/// merged from several config files, keeps its shape with the rest of the
+/// key selected in each table.
+fn select_partial(mut value: JsonValue, segments: &[(&str, &str)]) -> Option<JsonValue> {
+    let Some(((lookup, shown), rest)) = segments.split_first() else {
+        return Some(value);
+    };
+    if let JsonValue::Array(items) = value {
+        let items = items
+            .into_iter()
+            .filter_map(|item| select_partial(item, segments))
+            .collect_vec();
+        return (!items.is_empty()).then_some(JsonValue::Array(items));
+    }
+    let child = key_spellings(lookup)
+        .into_iter()
+        .find_map(|spelling| value.get_mut(&spelling).map(JsonValue::take))?;
+    let child = select_partial(child, rest)?;
+    Some(JsonValue::Object(
+        [(shown.to_string(), child)].into_iter().collect(),
+    ))
 }
 
 /// Match supported keys, with each `<...>` placeholder matching one segment.
@@ -2484,6 +2496,37 @@ timeout-seconds = 7
         assert_eq!(
             partial_config(&config, "virtual-package-detectors.timeout-seconds").unwrap(),
             serde_json::json!({"virtual-package-detectors": {"timeout-seconds": 7}})
+        );
+    }
+
+    /// Two config files with an `attestation-verification.default` rule merge
+    /// into an array of tables. Selecting a key below it selects it in every
+    /// rule.
+    #[test]
+    fn test_partial_config_through_merged_rules() {
+        let layer = |identity: &str| {
+            Config::from_toml(
+                &format!("[attestation-verification]\ndefault.identity = \"{identity}\""),
+                None,
+            )
+            .unwrap()
+            .0
+        };
+        let config = layer("https://github.com/my-org/*")
+            .merge_config(layer("https://github.com/other-org/*"));
+
+        let partial = partial_config(&config, "attestation-verification.default.identity").unwrap();
+        insta::assert_snapshot!(toml_edit::ser::to_string_pretty(&partial).unwrap(), @r#"
+        [[attestation-verification.default]]
+        identity = "https://github.com/my-org/*"
+
+        [[attestation-verification.default]]
+        identity = "https://github.com/other-org/*"
+        "#);
+
+        assert_eq!(
+            partial_config(&config, "attestation-verification.default.issuer").unwrap(),
+            serde_json::json!({})
         );
     }
 

@@ -12,6 +12,7 @@ use std::{
 
 use crate::lock_file::{
     LockedPypiRecord,
+    attestation::{AttestationChecker, AttestationConfigError, AttestationError, LockedPackages},
     records_by_name::{HasNameVersion, LockedPypiRecordsByName},
 };
 use barrier_cell::BarrierCell;
@@ -607,6 +608,10 @@ pub enum UpdateLockFileError {
 
     #[error(transparent)]
     #[diagnostic(transparent)]
+    AttestationConfig(#[from] AttestationConfigError),
+
+    #[error(transparent)]
+    #[diagnostic(transparent)]
     LoadLockFile(#[from] LoadLockFileError),
 
     #[error(transparent)]
@@ -806,6 +811,15 @@ pub enum SolveCondaEnvironmentError {
         "source specifications are not supported in the `[constraints]` table, but a source constraint was found for '{0}'"
     )]
     SourceConstraintNotSupported(String),
+
+    #[error("failed to verify package attestations of environment '{}' for platform '{}'", .environment_name.fancy_display(), .platform)]
+    AttestationVerification {
+        environment_name: GroupedEnvironmentName,
+        platform: PixiPlatformName,
+        #[source]
+        #[diagnostic_source]
+        source: AttestationError,
+    },
 }
 
 impl From<ParseChannelError> for SolveCondaEnvironmentError {
@@ -1913,6 +1927,9 @@ pub struct UpdateContext<'p> {
     dispatcher_progress_bar: ProgressBar,
     /// Optional list of packages explicitly targeted for update.
     update_targets: Option<std::collections::HashSet<String>>,
+
+    /// Checks the attestations of newly locked conda packages, if enabled.
+    attestation_checker: Option<Arc<AttestationChecker>>,
 }
 
 impl<'p> UpdateContext<'p> {
@@ -2125,6 +2142,10 @@ pub struct UpdateContextBuilder<'p> {
     /// Pre-built resolver for the input lock file, shared with the caller.
     /// When `None`, the builder builds its own resolver in `finish`.
     resolver: Option<Arc<LockFileResolver>>,
+
+    /// The packages of the lock file before packages were unlocked for an
+    /// update. When `None`, the packages of `lock_file` are used.
+    original_locked_packages: Option<LockedPackages>,
 }
 
 impl<'p> UpdateContextBuilder<'p> {
@@ -2155,6 +2176,21 @@ impl<'p> UpdateContextBuilder<'p> {
     /// previously locked packages.
     pub fn with_lock_file(self, lock_file: LockFile) -> Self {
         Self { lock_file, ..self }
+    }
+
+    /// Sets the lock file as it was before packages were unlocked for an
+    /// update, if `with_lock_file` is given a relaxed copy of it.
+    ///
+    /// Attestations are only checked for packages that are not in this lock
+    /// file, so packages that re-solve to the same build are not checked
+    /// again.
+    pub fn with_original_lock_file(self, lock_file: &LockFile) -> Self {
+        let enabled = self.project.config().attestation_verification.mode()
+            != pixi_config::AttestationVerificationMode::Disabled;
+        Self {
+            original_locked_packages: enabled.then(|| LockedPackages::from_lock_file(lock_file)),
+            ..self
+        }
     }
 
     /// Sets the packages explicitly targeted for update.
@@ -2229,6 +2265,21 @@ impl<'p> UpdateContextBuilder<'p> {
             input.seed_resolver(resolver);
         }
         let resolver = input.resolver()?;
+
+        // Validated before anything is solved, so that a configuration error
+        // is not reported as a failure of a particular environment.
+        let config = project.config();
+        let attestation_checker = AttestationChecker::new(
+            &config.attestation_verification,
+            || {
+                self.original_locked_packages
+                    .unwrap_or_else(|| LockedPackages::from_lock_file(&input.lock_file))
+            },
+            self.command_dispatcher.download_client().clone(),
+            config.offline(),
+            config.max_concurrent_downloads(),
+        )?
+        .map(Arc::new);
 
         let mut outdated = match self.outdated_environments {
             Some(outdated) => outdated,
@@ -2472,6 +2523,7 @@ impl<'p> UpdateContextBuilder<'p> {
 
             no_install: self.no_install,
             update_targets: self.update_targets,
+            attestation_checker,
         })
     }
 }
@@ -2494,6 +2546,7 @@ impl<'p> UpdateContext<'p> {
             command_dispatcher,
             update_targets: None,
             resolver: None,
+            original_locked_packages: None,
         }
     }
 
@@ -2607,6 +2660,7 @@ impl<'p> UpdateContext<'p> {
                     channel_priority,
                     command_dispatcher,
                     pin_overrides,
+                    self.attestation_checker.clone(),
                 )
                 .map(|result| result.map_err_with(UpdateLockFileError::from))
                 .boxed_local();
@@ -3187,6 +3241,7 @@ async fn spawn_solve_conda_environment_task(
     channel_priority: ChannelPriority,
     command_dispatcher: CommandDispatcher,
     pin_overrides: BTreeMap<rattler_conda_types::PackageName, pixi_record::PinnedSourceSpec>,
+    attestation_checker: Option<Arc<AttestationChecker>>,
 ) -> Result<TaskResult, CommandDispatcherError<SolveCondaEnvironmentError>> {
     let pixi_platform = group
         .workspace_manifest()
@@ -3368,6 +3423,28 @@ async fn spawn_solve_conda_environment_task(
                 CommandDispatcherError::Failed(SolveCondaEnvironmentError::PypiMappingFailed(
                     err.into(),
                 ))
+            })?;
+    }
+
+    // Check the attestations of the packages that are new to the lock file,
+    // before they can be installed.
+    if let Some(checker) = attestation_checker {
+        let scope = format!(
+            "environment '{}' for platform '{}'",
+            group_name.fancy_display(),
+            platform
+        );
+        checker
+            .check(records.iter().filter_map(PixiRecord::as_binary), &scope)
+            .await
+            .map_err(|source| {
+                CommandDispatcherError::Failed(
+                    SolveCondaEnvironmentError::AttestationVerification {
+                        environment_name: group_name.clone(),
+                        platform: platform.clone(),
+                        source,
+                    },
+                )
             })?;
     }
 

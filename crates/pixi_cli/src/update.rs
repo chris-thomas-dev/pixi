@@ -179,6 +179,7 @@ pub async fn execute(args: Args) -> miette::Result<()> {
         let _clear_progress = pixi_reporters::TopLevelProgress::clear_when_done(Some(&progress));
         UpdateContext::builder(&workspace, dispatcher)
             .with_lock_file(relaxed_lock_file.clone())
+            .with_original_lock_file(loaded_lock_file)
             .with_no_install(args.no_install)
             .with_update_targets(specs.packages.clone())
             .finish()

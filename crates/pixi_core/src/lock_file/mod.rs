@@ -1,3 +1,4 @@
+mod attestation;
 mod install_subset;
 mod outdated;
 mod package_identifier;

@@ -443,6 +443,12 @@ impl ProjectChannelAddBuilder {
         self
     }
 
+    /// Adds the channels before the existing ones, as `--prepend` does.
+    pub fn with_prepend(mut self) -> Self {
+        self.args.prepend = true;
+        self
+    }
+
     /// Alias to add a local channel.
     pub fn with_local_channel(self, channel: impl AsRef<Path>) -> Self {
         self.with_channel(Url::from_directory_path(channel).unwrap())
